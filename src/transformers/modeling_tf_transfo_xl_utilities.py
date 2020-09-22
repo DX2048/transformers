@@ -24,7 +24,7 @@ from .modeling_tf_utils import shape_list
 
 class TFAdaptiveSoftmaxMask(tf.keras.layers.Layer):
     def __init__(self, vocab_size, d_embed, d_proj, cutoffs, div_val=1, keep_order=False, **kwargs):
-        super(TFAdaptiveSoftmaxMask, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
         self.vocab_size = vocab_size
         self.d_embed = d_embed
@@ -64,7 +64,10 @@ class TFAdaptiveSoftmaxMask(tf.keras.layers.Layer):
                 else:
                     self.out_projs.append(None)
                 weight = self.add_weight(
-                    shape=(self.vocab_size, self.d_embed,),
+                    shape=(
+                        self.vocab_size,
+                        self.d_embed,
+                    ),
                     initializer="zeros",
                     trainable=True,
                     name="out_layers_._{}_._weight".format(i),
@@ -86,7 +89,10 @@ class TFAdaptiveSoftmaxMask(tf.keras.layers.Layer):
                 )
                 self.out_projs.append(weight)
                 weight = self.add_weight(
-                    shape=(r_idx - l_idx, d_emb_i,),
+                    shape=(
+                        r_idx - l_idx,
+                        d_emb_i,
+                    ),
                     initializer="zeros",
                     trainable=True,
                     name="out_layers_._{}_._weight".format(i),
@@ -98,7 +104,7 @@ class TFAdaptiveSoftmaxMask(tf.keras.layers.Layer):
                     name="out_layers_._{}_._bias".format(i),
                 )
                 self.out_layers.append((weight, bias))
-        super(TFAdaptiveSoftmaxMask, self).build(input_shape)
+        super().build(input_shape)
 
     @staticmethod
     def _logit(x, W, b, proj=None):
@@ -114,8 +120,7 @@ class TFAdaptiveSoftmaxMask(tf.keras.layers.Layer):
         idx = tf.stack([r, target], 1)
         return tf.gather_nd(logprob, idx)
 
-    def call(self, inputs, return_mean=True, training=False):
-        hidden, target = inputs
+    def call(self, hidden, target, return_mean=True, training=False):
         head_logprob = 0
         if self.n_clusters == 0:
             output = self._logit(hidden, self.out_layers[0][0], self.out_layers[0][1], self.out_projs[0])

@@ -18,7 +18,7 @@ import json
 import os
 import unittest
 
-from transformers.tokenization_gpt2 import VOCAB_FILES_NAMES, GPT2Tokenizer
+from transformers.tokenization_gpt2 import VOCAB_FILES_NAMES, GPT2Tokenizer, GPT2TokenizerFast
 
 from .test_tokenization_common import TokenizerTesterMixin
 
@@ -26,9 +26,10 @@ from .test_tokenization_common import TokenizerTesterMixin
 class GPT2TokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
     tokenizer_class = GPT2Tokenizer
+    test_rust_tokenizer = True
 
     def setUp(self):
-        super(GPT2TokenizationTest, self).setUp()
+        super().setUp()
 
         # Adapted from Sennrich et al. 2015 and https://github.com/rsennrich/subword-nmt
         vocab = [
@@ -52,6 +53,7 @@ class GPT2TokenizationTest(TokenizerTesterMixin, unittest.TestCase):
             "\u0120newer",
             "\u0120wider",
             "<unk>",
+            "<|endoftext|>",
         ]
         vocab_tokens = dict(zip(vocab, range(len(vocab))))
         merges = ["#version: 0.2", "\u0120 l", "\u0120l o", "\u0120lo w", "e r", ""]
@@ -68,7 +70,11 @@ class GPT2TokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         kwargs.update(self.special_tokens_map)
         return GPT2Tokenizer.from_pretrained(self.tmpdirname, **kwargs)
 
-    def get_input_output_texts(self):
+    def get_rust_tokenizer(self, **kwargs):
+        kwargs.update(self.special_tokens_map)
+        return GPT2TokenizerFast.from_pretrained(self.tmpdirname, **kwargs)
+
+    def get_input_output_texts(self, tokenizer):
         input_text = "lower newer"
         output_text = "lower newer"
         return input_text, output_text
@@ -83,3 +89,38 @@ class GPT2TokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         input_tokens = tokens + [tokenizer.unk_token]
         input_bpe_tokens = [14, 15, 10, 9, 3, 2, 15, 19]
         self.assertListEqual(tokenizer.convert_tokens_to_ids(input_tokens), input_bpe_tokens)
+
+    def test_rust_and_python_full_tokenizers(self):
+        if not self.test_rust_tokenizer:
+            return
+
+        tokenizer = self.get_tokenizer()
+        rust_tokenizer = self.get_rust_tokenizer(add_prefix_space=True)
+
+        sequence = "lower newer"
+
+        # Testing tokenization
+        tokens = tokenizer.tokenize(sequence, add_prefix_space=True)
+        rust_tokens = rust_tokenizer.tokenize(sequence)
+        self.assertListEqual(tokens, rust_tokens)
+
+        # Testing conversion to ids without special tokens
+        ids = tokenizer.encode(sequence, add_special_tokens=False, add_prefix_space=True)
+        rust_ids = rust_tokenizer.encode(sequence, add_special_tokens=False)
+        self.assertListEqual(ids, rust_ids)
+
+        # Testing conversion to ids with special tokens
+        rust_tokenizer = self.get_rust_tokenizer(add_prefix_space=True)
+        ids = tokenizer.encode(sequence, add_prefix_space=True)
+        rust_ids = rust_tokenizer.encode(sequence)
+        self.assertListEqual(ids, rust_ids)
+
+        # Testing the unknown token
+        input_tokens = tokens + [rust_tokenizer.unk_token]
+        input_bpe_tokens = [14, 15, 10, 9, 3, 2, 15, 19]
+        self.assertListEqual(rust_tokenizer.convert_tokens_to_ids(input_tokens), input_bpe_tokens)
+
+    def test_pretokenized_inputs(self, *args, **kwargs):
+        # It's very difficult to mix/test pretokenization with byte-level
+        # And get both GPT2 and Roberta to work at the same time (mostly an issue of adding a space before the string)
+        pass

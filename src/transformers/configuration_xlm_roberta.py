@@ -15,13 +15,11 @@
 # limitations under the License.
 """ XLM-RoBERTa configuration """
 
-
-import logging
-
 from .configuration_roberta import RobertaConfig
+from .utils import logging
 
 
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 XLM_ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "xlm-roberta-base": "https://s3.amazonaws.com/models.huggingface.co/bert/xlm-roberta-base-config.json",
@@ -34,4 +32,9 @@ XLM_ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP = {
 
 
 class XLMRobertaConfig(RobertaConfig):
-    pretrained_config_archive_map = XLM_ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP
+    """
+    This class overrides :class:`~transformers.RobertaConfig`. Please check the
+    superclass for the appropriate documentation alongside usage examples.
+    """
+
+    model_type = "xlm-roberta"

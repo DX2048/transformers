@@ -17,10 +17,12 @@
 import os
 import unittest
 
+from transformers.testing_utils import slow
 from transformers.tokenization_bert import (
     VOCAB_FILES_NAMES,
     BasicTokenizer,
     BertTokenizer,
+    BertTokenizerFast,
     WordpieceTokenizer,
     _is_control,
     _is_punctuation,
@@ -28,20 +30,22 @@ from transformers.tokenization_bert import (
 )
 
 from .test_tokenization_common import TokenizerTesterMixin
-from .utils import slow
 
 
 class BertTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
     tokenizer_class = BertTokenizer
+    test_rust_tokenizer = True
 
     def setUp(self):
-        super(BertTokenizationTest, self).setUp()
+        super().setUp()
 
         vocab_tokens = [
             "[UNK]",
             "[CLS]",
             "[SEP]",
+            "[PAD]",
+            "[MASK]",
             "want",
             "##want",
             "##ed",
@@ -57,10 +61,10 @@ class BertTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         with open(self.vocab_file, "w", encoding="utf-8") as vocab_writer:
             vocab_writer.write("".join([x + "\n" for x in vocab_tokens]))
 
-    def get_tokenizer(self, **kwargs):
-        return BertTokenizer.from_pretrained(self.tmpdirname, **kwargs)
+    def get_rust_tokenizer(self, **kwargs):
+        return BertTokenizerFast.from_pretrained(self.tmpdirname, **kwargs)
 
-    def get_input_output_texts(self):
+    def get_input_output_texts(self, tokenizer):
         input_text = "UNwant\u00E9d,running"
         output_text = "unwanted, running"
         return input_text, output_text
@@ -70,7 +74,48 @@ class BertTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
         tokens = tokenizer.tokenize("UNwant\u00E9d,running")
         self.assertListEqual(tokens, ["un", "##want", "##ed", ",", "runn", "##ing"])
-        self.assertListEqual(tokenizer.convert_tokens_to_ids(tokens), [7, 4, 5, 10, 8, 9])
+        self.assertListEqual(tokenizer.convert_tokens_to_ids(tokens), [9, 6, 7, 12, 10, 11])
+
+    def test_rust_and_python_full_tokenizers(self):
+        if not self.test_rust_tokenizer:
+            return
+
+        tokenizer = self.get_tokenizer()
+        rust_tokenizer = self.get_rust_tokenizer()
+
+        sequence = "UNwant\u00E9d,running"
+
+        tokens = tokenizer.tokenize(sequence)
+        rust_tokens = rust_tokenizer.tokenize(sequence)
+        self.assertListEqual(tokens, rust_tokens)
+
+        ids = tokenizer.encode(sequence, add_special_tokens=False)
+        rust_ids = rust_tokenizer.encode(sequence, add_special_tokens=False)
+        self.assertListEqual(ids, rust_ids)
+
+        rust_tokenizer = self.get_rust_tokenizer()
+        ids = tokenizer.encode(sequence)
+        rust_ids = rust_tokenizer.encode(sequence)
+        self.assertListEqual(ids, rust_ids)
+
+        # With lower casing
+        tokenizer = self.get_tokenizer(do_lower_case=True)
+        rust_tokenizer = self.get_rust_tokenizer(do_lower_case=True)
+
+        sequence = "UNwant\u00E9d,running"
+
+        tokens = tokenizer.tokenize(sequence)
+        rust_tokens = rust_tokenizer.tokenize(sequence)
+        self.assertListEqual(tokens, rust_tokens)
+
+        ids = tokenizer.encode(sequence, add_special_tokens=False)
+        rust_ids = rust_tokenizer.encode(sequence, add_special_tokens=False)
+        self.assertListEqual(ids, rust_ids)
+
+        rust_tokenizer = self.get_rust_tokenizer()
+        ids = tokenizer.encode(sequence)
+        rust_ids = rust_tokenizer.encode(sequence)
+        self.assertListEqual(ids, rust_ids)
 
     def test_chinese(self):
         tokenizer = BasicTokenizer()
@@ -85,11 +130,56 @@ class BertTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         )
         self.assertListEqual(tokenizer.tokenize("H\u00E9llo"), ["hello"])
 
+    def test_basic_tokenizer_lower_strip_accents_false(self):
+        tokenizer = BasicTokenizer(do_lower_case=True, strip_accents=False)
+
+        self.assertListEqual(
+            tokenizer.tokenize(" \tHäLLo!how  \n Are yoU?  "), ["hällo", "!", "how", "are", "you", "?"]
+        )
+        self.assertListEqual(tokenizer.tokenize("H\u00E9llo"), ["h\u00E9llo"])
+
+    def test_basic_tokenizer_lower_strip_accents_true(self):
+        tokenizer = BasicTokenizer(do_lower_case=True, strip_accents=True)
+
+        self.assertListEqual(
+            tokenizer.tokenize(" \tHäLLo!how  \n Are yoU?  "), ["hallo", "!", "how", "are", "you", "?"]
+        )
+        self.assertListEqual(tokenizer.tokenize("H\u00E9llo"), ["hello"])
+
+    def test_basic_tokenizer_lower_strip_accents_default(self):
+        tokenizer = BasicTokenizer(do_lower_case=True)
+
+        self.assertListEqual(
+            tokenizer.tokenize(" \tHäLLo!how  \n Are yoU?  "), ["hallo", "!", "how", "are", "you", "?"]
+        )
+        self.assertListEqual(tokenizer.tokenize("H\u00E9llo"), ["hello"])
+
     def test_basic_tokenizer_no_lower(self):
         tokenizer = BasicTokenizer(do_lower_case=False)
 
         self.assertListEqual(
             tokenizer.tokenize(" \tHeLLo!how  \n Are yoU?  "), ["HeLLo", "!", "how", "Are", "yoU", "?"]
+        )
+
+    def test_basic_tokenizer_no_lower_strip_accents_false(self):
+        tokenizer = BasicTokenizer(do_lower_case=False, strip_accents=False)
+
+        self.assertListEqual(
+            tokenizer.tokenize(" \tHäLLo!how  \n Are yoU?  "), ["HäLLo", "!", "how", "Are", "yoU", "?"]
+        )
+
+    def test_basic_tokenizer_no_lower_strip_accents_true(self):
+        tokenizer = BasicTokenizer(do_lower_case=False, strip_accents=True)
+
+        self.assertListEqual(
+            tokenizer.tokenize(" \tHäLLo!how  \n Are yoU?  "), ["HaLLo", "!", "how", "Are", "yoU", "?"]
+        )
+
+    def test_basic_tokenizer_respects_never_split_tokens(self):
+        tokenizer = BasicTokenizer(do_lower_case=False, never_split=["[UNK]"])
+
+        self.assertListEqual(
+            tokenizer.tokenize(" \tHeLLo!how  \n Are yoU? [UNK]"), ["HeLLo", "!", "how", "Are", "yoU", "?", "[UNK]"]
         )
 
     def test_wordpiece_tokenizer(self):

@@ -19,28 +19,47 @@
 
 
 import glob
-import logging
 import os
 import pickle
+import re
+import warnings
 from collections import Counter, OrderedDict
+from typing import List, Optional
 
 import numpy as np
 
+import sacremoses as sm
+from tokenizers import Tokenizer
+from tokenizers.implementations import BaseTokenizer
+from tokenizers.models import WordLevel
+from tokenizers.normalizers import Lowercase, Sequence, Strip, unicode_normalizer_from_str
+from tokenizers.pre_tokenizers import CharDelimiterSplit, WhitespaceSplit
+from tokenizers.processors import BertProcessing
+
 from .file_utils import cached_path, is_torch_available
 from .tokenization_utils import PreTrainedTokenizer
+from .tokenization_utils_fast import PreTrainedTokenizerFast
+from .utils import logging
 
 
 if is_torch_available():
     import torch
 
 
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 VOCAB_FILES_NAMES = {"pretrained_vocab_file": "vocab.bin", "vocab_file": "vocab.txt"}
+VOCAB_FILES_NAMES_FAST = {"pretrained_vocab_file": "vocab.json", "vocab_file": "vocab.json"}
 
 PRETRAINED_VOCAB_FILES_MAP = {
     "pretrained_vocab_file": {
         "transfo-xl-wt103": "https://s3.amazonaws.com/models.huggingface.co/bert/transfo-xl-wt103-vocab.bin",
+    }
+}
+
+PRETRAINED_VOCAB_FILES_MAP_FAST = {
+    "pretrained_vocab_file": {
+        "transfo-xl-wt103": "https://s3.amazonaws.com/models.huggingface.co/bert/transfo-xl-wt103-vocab.json",
     }
 }
 
@@ -53,15 +72,60 @@ PRETRAINED_CORPUS_ARCHIVE_MAP = {
 }
 CORPUS_NAME = "corpus.bin"
 
+MATCH_NUMBERS = r"(?<=\d)[,.](?=\d)", r" @\g<0>@ "
+DETOKENIZE_NUMBERS = [(r" @\,@ ", r","), (r" @\.@ ", r".")]
+
+
+def tokenize_numbers(text_array: List[str]) -> List[str]:
+    """
+    Splits large comma-separated numbers and floating point values.
+    This is done by replacing commas with ' @,@ ' and dots with ' @.@ '.
+    Args:
+        text_array: An already tokenized text as list
+    Returns:
+        A list of strings with tokenized numbers
+    Example::
+        >>> tokenize_numbers(["$", "5,000", "1.73", "m"])
+        ["$", "5", "@,@", "000", "1", "@.@", "73", "m"]
+    """
+    tokenized = []
+    for i in range(len(text_array)):
+        reg, sub = MATCH_NUMBERS
+        replaced = re.sub(reg, sub, text_array[i]).split()
+        tokenized.extend(replaced)
+
+    return tokenized
+
+
+def detokenize_numbers(text: str) -> str:
+    """
+    Inverts the operation of `tokenize_numbers`.
+    This is replacing ' @,@ ' and ' @.@' by ',' and '.'.
+    Args:
+        text: A string where the number should be detokenized
+    Returns:
+        A detokenized string
+    Example::
+        >>> detokenize_numbers("$ 5 @,@ 000 1 @.@ 73 m")
+        "$ 5,000 1.73 m"
+    """
+    for reg, sub in DETOKENIZE_NUMBERS:
+        text = re.sub(reg, sub, text)
+    return text
+
 
 class TransfoXLTokenizer(PreTrainedTokenizer):
     """
     Transformer-XL tokenizer adapted from Vocab class in https://github.com/kimiyoung/transformer-xl
+
+    This tokenizer inherits from :class:`~transformers.PreTrainedTokenizer` which contains most of the methods. Users
+    should refer to the superclass for more information regarding methods.
     """
 
     vocab_files_names = VOCAB_FILES_NAMES
     pretrained_vocab_files_map = PRETRAINED_VOCAB_FILES_MAP
     max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
+    model_input_names = []
 
     def __init__(
         self,
@@ -76,18 +140,12 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
         unk_token="<unk>",
         eos_token="<eos>",
         additional_special_tokens=["<formula>"],
+        language="en",
         **kwargs
     ):
-        super(TransfoXLTokenizer, self).__init__(
+        super().__init__(
             unk_token=unk_token, eos_token=eos_token, additional_special_tokens=additional_special_tokens, **kwargs
         )
-
-        self.max_len_single_sentence = (
-            self.max_len
-        )  # no default special tokens - you can update this value if you add special tokens
-        self.max_len_sentences_pair = (
-            self.max_len
-        )  # no default special tokens - you can update this value if you add special tokens
 
         if never_split is None:
             never_split = self.all_special_tokens
@@ -101,22 +159,44 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
         self.delimiter = delimiter
         self.vocab_file = vocab_file
         self.never_split = never_split
+        self.punctuation_symbols = '!"#$%&()*+,-./\\:;<=>?@[\\]^_`{|}~'
+        self.punction_without_space_before_pattern = re.compile(r"[^\s][{}]".format(self.punctuation_symbols))
+        self.punctuation_with_space_around_pattern = self._compile_space_around_punctuation_pattern()
+        self.language = language
+        self.moses_punct_normalizer = sm.MosesPunctNormalizer(language)
+        self.moses_tokenizer = sm.MosesTokenizer(language)
+        self.moses_detokenizer = sm.MosesDetokenizer(language)
 
-        if pretrained_vocab_file is not None:
-            # Hack because, honestly this tokenizer was not made to be used
-            # in a library like ours, at all.
-            vocab_dict = torch.load(pretrained_vocab_file)
-            for key, value in vocab_dict.items():
-                if key not in self.__dict__:
-                    self.__dict__[key] = value
+        try:
+            if pretrained_vocab_file is not None:
+                # Hack because, honestly this tokenizer was not made to be used
+                # in a library like ours, at all.
+                vocab_dict = torch.load(pretrained_vocab_file)
+                for key, value in vocab_dict.items():
+                    if key not in self.__dict__:
+                        self.__dict__[key] = value
+
+            if vocab_file is not None:
+                self.build_vocab()
+        except Exception:
+            raise ValueError(
+                "Unable to parse file {}. Unknown format. "
+                "If you tried to load a model saved through TransfoXLTokenizerFast,"
+                "please note they are not compatible.".format(pretrained_vocab_file)
+            )
 
         if vocab_file is not None:
             self.build_vocab()
 
+    def _compile_space_around_punctuation_pattern(self):
+        look_ahead_for_special_token = "(?=[{}])".format(self.punctuation_symbols)
+        look_ahead_to_match_all_except_space = r"(?=[^\s])"
+        return re.compile(r"" + look_ahead_for_special_token + look_ahead_to_match_all_except_space)
+
     def count_file(self, path, verbose=False, add_eos=False):
         if verbose:
             logger.info("counting file {} ...".format(path))
-        assert os.path.exists(path)
+        assert os.path.exists(path), f"Input file {path} not found"
 
         sents = []
         with open(path, "r", encoding="utf-8") as f:
@@ -131,7 +211,7 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
 
     def count_sents(self, sents, verbose=False):
         """
-            sents : a list of sentences, each a list of tokenized symbols
+        sents : a list of sentences, each a list of tokenized symbols
         """
         if verbose:
             logger.info("counting {} sents ...".format(len(sents)))
@@ -156,9 +236,26 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
             raise ValueError("No <unkown> token in vocabulary")
 
     def save_vocabulary(self, vocab_path):
-        """Save the tokenizer vocabulary to a directory or file."""
+        """
+        Save the vocabulary and special tokens file to a directory.
+
+        Args:
+            vocab_path (:obj:`str`):
+                The directory in which to save the vocabulary.
+
+        Returns:
+            :obj:`Tuple(str)`: Paths to the files saved.
+        """
+
+        logger.warning(
+            "Please note you will not be able to load the save vocabulary in"
+            " Rust-based TransfoXLTokenizerFast as they don't share the same structure."
+        )
+
         if os.path.isdir(vocab_path):
             vocab_file = os.path.join(vocab_path, VOCAB_FILES_NAMES["pretrained_vocab_file"])
+        else:
+            vocab_file = vocab_path
         torch.save(self.__dict__, vocab_file)
         return (vocab_file,)
 
@@ -185,7 +282,7 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True, add_double_eos=False):
         if verbose:
             logger.info("encoding file {} ...".format(path))
-        assert os.path.exists(path)
+        assert os.path.exists(path), f"Output file {path} not found"
         encoded = []
         with open(path, "r", encoding="utf-8") as f:
             for idx, line in enumerate(f):
@@ -224,6 +321,61 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
             self.idx2sym.append(sym)
             self.sym2idx[sym] = len(self.idx2sym) - 1
 
+    def move_added_token(self, token: str, target_idx: int):
+        """
+        Moves an added token to a specific position in the vocab.
+        This method should be used when resizing an embedding layer other than the last one in the `AdaptiveEmbedding`
+        in order to move the token in the tokenizer from the default position (at the very end) to the desired one.
+
+        Args:
+            token: The token to move to a specific position in the vocab.
+            target_idx: The position where the token should be moved to.
+        """
+        assert token in self.added_tokens_encoder, "Token which should be moved has to be an added token"
+        assert token not in self.idx2sym, "Token which should be moved is already in vocab"
+
+        # Insert sym into vocab
+        self.idx2sym.insert(target_idx, token)
+        self.sym2idx[token] = target_idx
+
+        # Shift following indices in sym2idx
+        for idx in range(target_idx + 1, len(self.idx2sym)):
+            current_sym = self.idx2sym[idx]
+            self.sym2idx[current_sym] = idx
+
+        # Delete token from added_tokens
+        old_index = self.added_tokens_encoder[token]
+        del self.added_tokens_decoder[old_index]
+        del self.added_tokens_encoder[token]
+
+    def moses_punct_norm(self, text):
+        return self.moses_punct_normalizer.normalize(text)
+
+    def moses_tokenize(self, text):
+        return self.moses_tokenizer.tokenize(
+            text, aggressive_dash_splits=True, return_str=False, escape=False, protected_patterns=self.never_split
+        )
+
+    def moses_pipeline(self, text: str) -> List[str]:
+        """
+        Does basic tokenization using :class:`sacremoses.MosesPunctNormalizer` and :class:`sacremoses.MosesTokenizer`
+        with `aggressive_dash_splits=True` (see :func:`sacremoses.tokenize.MosesTokenizer.tokenize`).
+        Additionally, large comma-separated numbers and floating point values are split.
+        E.g. "23,000 people are 1.80m tall" -> "23 @,@ 000 people are 1 @.@ 80m tall".
+        Args:
+            text: Text to be tokenized
+        Returns:
+            A list of tokenized strings
+        Example::
+            >>> tokenizer = TransfoXLTokenizer.from_pretrained("transfo-xl-wt103")
+            >>> tokenizer.moses_pipeline("23,000 people are 1.80 m tall")
+            ['23', '@,@', '000', 'people', 'are', '1', '@.@', '80', 'm', 'tall']
+        """
+        text = self.moses_punct_norm(text)
+        text = self.moses_tokenize(text)
+        text = tokenize_numbers(text)
+        return text
+
     def _convert_id_to_token(self, idx):
         """Converts an id in a token (BPE) using the vocab."""
         assert 0 <= idx < len(self), "Index {} out of vocabulary range".format(idx)
@@ -247,9 +399,12 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
                 raise ValueError("Token not in vocabulary and no <unk> token in vocabulary for replacement")
 
     def convert_tokens_to_string(self, tokens):
-        """ Converts a sequence of tokens (string) in a single string. """
-        out_string = " ".join(tokens).strip()
-        return out_string
+        """
+        Converts a sequence of tokens (string) in a single string.
+        Additionally, the split numbers are converted back into it's original form.
+        """
+        out_string = self.moses_detokenizer.detokenize(tokens)
+        return detokenize_numbers(out_string).strip()
 
     def convert_to_tensor(self, symbols):
         return torch.LongTensor(self.convert_tokens_to_ids(symbols))
@@ -257,6 +412,9 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
     @property
     def vocab_size(self):
         return len(self.idx2sym)
+
+    def get_vocab(self):
+        return dict(self.sym2idx, **self.added_tokens_encoder)
 
     def _tokenize(self, line, add_eos=False, add_double_eos=False):
         line = line.strip()
@@ -268,7 +426,7 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
         if self.delimiter == "":
             symbols = line
         else:
-            symbols = line.split(self.delimiter)
+            symbols = self.moses_pipeline(line)
 
         if add_double_eos:  # lm1b
             return ["<S>"] + symbols + ["<S>"]
@@ -278,10 +436,138 @@ class TransfoXLTokenizer(PreTrainedTokenizer):
             return symbols
 
 
+class _TransfoXLDelimiterLookupTokenizer(BaseTokenizer):
+    def __init__(
+        self,
+        vocab_file,
+        delimiter,
+        lowercase,
+        unk_token,
+        eos_token,
+        add_eos=False,
+        add_double_eos=False,
+        normalization: Optional[str] = None,
+    ):
+
+        try:
+            tokenizer = WordLevel(vocab_file, unk_token=unk_token)
+            tokenizer = Tokenizer(tokenizer)
+        except Exception:
+            raise ValueError(
+                "Unable to parse file {}. Unknown format. "
+                "If you tried to load a model saved through TransfoXLTokenizer,"
+                "please note they are not compatible.".format(vocab_file)
+            )
+
+        # Create the correct normalization path
+        normalizer = []
+
+        # Include unicode normalization
+        if normalization:
+            normalizer += [unicode_normalizer_from_str(normalization)]
+
+        # Include case normalization
+        if lowercase:
+            normalizer += [Lowercase()]
+
+        # Strip normalizer at the end
+        normalizer += [Strip(left=True, right=True)]
+
+        if len(normalizer) > 0:
+            tokenizer.normalizer = Sequence(normalizer) if len(normalizer) > 1 else normalizer[0]
+
+        # Setup the splitter
+        tokenizer.pre_tokenizer = CharDelimiterSplit(delimiter) if delimiter else WhitespaceSplit()
+
+        if add_double_eos:
+            tokenizer.post_processor = BertProcessing(
+                (eos_token, tokenizer.token_to_id(eos_token)), (eos_token, tokenizer.token_to_id(eos_token))
+            )
+
+        parameters = {
+            "model": "TransfoXLModel",
+            "add_eos": add_eos,
+            "add_double_eos": add_double_eos,
+            "unk_token": unk_token,
+            "eos_token": eos_token,
+            "delimiter": delimiter,
+            "lowercase": lowercase,
+        }
+
+        super().__init__(tokenizer, parameters)
+
+
+class TransfoXLTokenizerFast(PreTrainedTokenizerFast):
+    """
+    Construct a "Fast" Transformer-XL tokenizer (backed by HuggingFace's `tokenizers` library).
+
+    The Transformer-XL tokenizer is a word-level tokenizer (no sub-word tokenization).
+
+    Adapted from Vocab class in https://github.com/kimiyoung/transformer-xl
+
+    This tokenizer inherits from :class:`~transformers.PreTrainedTokenizerFast` which contains most of the methods. Users
+    should refer to the superclass for more information regarding methods.
+    """
+
+    vocab_files_names = VOCAB_FILES_NAMES_FAST
+    pretrained_vocab_files_map = PRETRAINED_VOCAB_FILES_MAP_FAST
+    max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
+    model_input_names = []
+
+    def __init__(
+        self,
+        special=None,
+        min_freq=0,
+        max_size=None,
+        lower_case=False,
+        delimiter=None,
+        vocab_file=None,
+        pretrained_vocab_file=None,
+        never_split=None,
+        unk_token="<unk>",
+        eos_token="<eos>",
+        additional_special_tokens=["<formula>"],
+        add_eos=False,
+        add_double_eos=False,
+        normalization=None,
+        **kwargs
+    ):
+
+        super().__init__(
+            _TransfoXLDelimiterLookupTokenizer(
+                vocab_file=vocab_file or pretrained_vocab_file,
+                delimiter=delimiter,
+                lowercase=lower_case,
+                unk_token=unk_token,
+                eos_token=eos_token,
+                add_eos=add_eos,
+                add_double_eos=add_double_eos,
+                normalization=normalization,
+            ),
+            unk_token=unk_token,
+            eos_token=eos_token,
+            additional_special_tokens=additional_special_tokens,
+            **kwargs,
+        )
+
+        warnings.warn(
+            "The class `TransfoXLTokenizerFast` is deprecated and will be removed in a future version. Please use `TransfoXLTokenizer` with it's enhanced tokenization instead.",
+            FutureWarning,
+        )
+
+    def save_pretrained(self, save_directory):
+        logger.warning(
+            "Please note you will not be able to load the vocabulary in"
+            " Python-based TransfoXLTokenizer as they don't share the same structure."
+        )
+
+        return super().save_pretrained(save_directory)
+
+
 class LMOrderedIterator(object):
     def __init__(self, data, bsz, bptt, device="cpu", ext_len=None):
         """
-            data -- LongTensor -- the LongTensor is strictly ordered
+        data -- LongTensor -- the LongTensor is strictly ordered
         """
         self.bsz = bsz
         self.bptt = bptt
@@ -340,7 +626,7 @@ class LMOrderedIterator(object):
 class LMShuffledIterator(object):
     def __init__(self, data, bsz, bptt, device="cpu", ext_len=None, shuffle=False):
         """
-            data -- list[LongTensor] -- there is no order among the LongTensors
+        data -- list[LongTensor] -- there is no order among the LongTensors
         """
         self.data = data
 
